@@ -1,0 +1,369 @@
+Subject: [PATCH] wifi: ath11k: add a diagnostic RX ring memory census
+
+Expose a root-readable rx_memory snapshot per radio when debugfs is built.
+Count ring-owned skb head fragments and deduplicate their compound page
+heads. Report reachable backing bytes, snapshot completeness and lock hold
+time without tracing allocations or changing the allocator.
+
+Serialize readers with ring initialization and destruction. Copy page
+identities and orders under the existing IDR lock, then sort outside it.
+Keep only formatted text after open, so partial reads do not repeat the
+census or retain pointers into the driver. Bound each walk to 8192 buffers.
+
+This is temporary diagnostic code, intended for both baseline and candidate
+builds. Rings are sampled separately: their backing totals must not be
+added because pages can be shared and the snapshots are not simultaneous.
+This excludes CE buffers, packet payload fragments, buffers already handed
+to the networking stack, and cache-only references. It is not total driver
+memory accounting and does not validate firmware recovery.
+
+---
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -708,6 +708,11 @@ struct ath11k {
+ 	 * concurrent debugfs configuration and concurrent FW statistics events.
+ 	 */
+ 	struct mutex conf_mutex;
++	/* Serializes diagnostic snapshots with RX ring initialization/teardown. */
++	struct mutex rx_mem_mutex;
++	bool rx_mem_ready;
++	u32 rx_mem_generation;
++	struct dentry *rx_mem_dentry;
+ 	/* protects the radio specific data like debug stats, ppdu_stats_info stats,
+ 	 * vdev_stop_status info, scan data, ath11k_sta info, ath11k_vif info,
+ 	 * channel context data, survey info, test mode data, channel_update_queue.
+--- a/drivers/net/wireless/ath/ath11k/debugfs.c
++++ b/drivers/net/wireless/ath/ath11k/debugfs.c
+@@ -5,9 +5,13 @@
+  */
+ 
+ #include <linux/export.h>
++#include <linux/ktime.h>
++#include <linux/mm.h>
++#include <linux/sort.h>
+ #include <linux/vmalloc.h>
+ 
+ #include "debugfs.h"
++#include "debugfs_rx_mem.h"
+ 
+ #include "core.h"
+ #include "debug.h"
+@@ -1466,6 +1470,152 @@ static const struct file_operations fops
+ 	.llseek = default_llseek,
+ };
+ 
++/* Diagnostic only: no allocation/free probes or per-packet bookkeeping. */
++#define ATH11K_RX_MEM_MAX_BUFFERS 8192
++#define ATH11K_RX_MEM_TEXT_SIZE 4096
++
++struct ath11k_rx_mem_snapshot {
++	size_t len;
++	char text[ATH11K_RX_MEM_TEXT_SIZE];
++};
++
++static void
++ath11k_rx_mem_ring(struct ath11k_rx_mem_snapshot *snapshot,
++		   struct dp_rxdma_ring *ring, const char *name,
++		   struct ath11k_rx_mem_page *pages)
++{
++	struct ath11k_rx_mem_totals totals;
++	unsigned int sampled = 0, fragments = 0, non_fragments = 0, invalid = 0;
++	struct sk_buff *skb;
++	struct page *page;
++	u64 start_ns, lock_ns;
++	bool truncated = false;
++	int id;
++
++	/* The IDR owns these skbs until removal under this same lock. Copy only
++	 * page identities/orders; never dereference them after unlocking.
++	 */
++	spin_lock_bh(&ring->idr_lock);
++	start_ns = ktime_get_ns();
++	idr_for_each_entry(&ring->bufs_idr, skb, id) {
++		if (sampled == ATH11K_RX_MEM_MAX_BUFFERS) {
++			truncated = true;
++			break;
++		}
++		sampled++;
++		if (!skb->head) {
++			invalid++;
++			continue;
++		}
++		if (!skb->head_frag) {
++			non_fragments++;
++			continue;
++		}
++		page = virt_to_head_page(skb->head);
++		pages[fragments].head = (unsigned long)page;
++		pages[fragments].order = compound_order(page);
++		fragments++;
++	}
++	lock_ns = ktime_get_ns() - start_ns;
++	spin_unlock_bh(&ring->idr_lock);
++
++	sort(pages, fragments, sizeof(*pages), ath11k_rx_mem_cmp, NULL);
++	totals = ath11k_rx_mem_sum(pages, fragments, PAGE_SHIFT);
++	snapshot->len += scnprintf(snapshot->text + snapshot->len,
++				   sizeof(snapshot->text) - snapshot->len,
++		"ring=%s complete=%u sampled_buffers=%u fragment_buffers=%u non_fragment_buffers=%u invalid_buffers=%u truncated=%u unique_pages=%u backing_bytes=%llu order0_pages=%u higher_order_pages=%u inconsistent_pages=%u lock_hold_ns=%llu\n",
++		name, !(truncated || invalid || non_fragments ||
++			totals.inconsistent_pages), sampled, fragments,
++		non_fragments, invalid, truncated, totals.unique_pages,
++		totals.backing_bytes, totals.order0_pages, totals.higher_order_pages,
++		totals.inconsistent_pages, lock_ns);
++}
++
++static int ath11k_rx_mem_open(struct inode *inode, struct file *file)
++{
++	struct ath11k *ar = inode->i_private;
++	struct ath11k_rx_mem_snapshot *snapshot;
++	struct ath11k_rx_mem_page *pages;
++	u64 start_ns;
++	char name[32];
++	int ret = 0;
++	int i;
++
++	snapshot = kzalloc(sizeof(*snapshot), GFP_KERNEL | __GFP_NORETRY);
++	if (!snapshot)
++		return -ENOMEM;
++	pages = kvcalloc(ATH11K_RX_MEM_MAX_BUFFERS, sizeof(*pages),
++			 GFP_KERNEL | __GFP_NORETRY);
++	if (!pages) {
++		kfree(snapshot);
++		return -ENOMEM;
++	}
++
++	/* Never wait behind recovery or another census. There is no nesting
++	 * with core_lock/conf_mutex or an SRNG lock in this reader.
++	 */
++	if (!mutex_trylock(&ar->rx_mem_mutex)) {
++		ret = -EBUSY;
++		goto out_free;
++	}
++	if (!ar->rx_mem_ready) {
++		ret = -EAGAIN;
++		goto out_unlock;
++	}
++
++	start_ns = ktime_get_boottime_ns();
++	snapshot->len = scnprintf(snapshot->text, sizeof(snapshot->text),
++				  "version=1 pdev=%u generation=%u start_boottime_ns=%llu page_size=%lu max_buffers=%u scratch_bytes=%zu\n",
++		ar->pdev_idx, ar->rx_mem_generation, start_ns, PAGE_SIZE,
++		ATH11K_RX_MEM_MAX_BUFFERS,
++		ATH11K_RX_MEM_MAX_BUFFERS * sizeof(*pages));
++	ath11k_rx_mem_ring(snapshot, &ar->dp.rx_refill_buf_ring, "rx", pages);
++	ath11k_rx_mem_ring(snapshot, &ar->dp.rxdma_mon_buf_ring, "monitor", pages);
++	for (i = 0; i < ar->ab->hw_params.num_rxdma_per_pdev; i++) {
++		snprintf(name, sizeof(name), "monitor_status_%d", i);
++		ath11k_rx_mem_ring(snapshot, &ar->dp.rx_mon_status_refill_ring[i],
++				   name, pages);
++	}
++	snapshot->len += scnprintf(snapshot->text + snapshot->len,
++				   sizeof(snapshot->text) - snapshot->len,
++		"elapsed_ns=%llu\n", ktime_get_boottime_ns() - start_ns);
++	if (snapshot->len == sizeof(snapshot->text) - 1)
++		ret = -EOVERFLOW;
++
++out_unlock:
++	mutex_unlock(&ar->rx_mem_mutex);
++out_free:
++	kvfree(pages);
++	if (ret)
++		kfree(snapshot);
++	else
++		file->private_data = snapshot;
++	return ret;
++}
++
++static ssize_t ath11k_rx_mem_read(struct file *file, char __user *buf,
++				  size_t count, loff_t *ppos)
++{
++	struct ath11k_rx_mem_snapshot *snapshot = file->private_data;
++
++	return simple_read_from_buffer(buf, count, ppos, snapshot->text,
++				       snapshot->len);
++}
++
++static int ath11k_rx_mem_release(struct inode *inode, struct file *file)
++{
++	kfree(file->private_data);
++	return 0;
++}
++
++static const struct file_operations fops_rx_memory = {
++	.owner = THIS_MODULE,
++	.open = ath11k_rx_mem_open,
++	.read = ath11k_rx_mem_read,
++	.release = ath11k_rx_mem_release,
++	.llseek = default_llseek,
++};
++
+ int ath11k_debugfs_register(struct ath11k *ar)
+ {
+ 	struct ath11k_base *ab = ar->ab;
+@@ -1486,6 +1636,15 @@ int ath11k_debugfs_register(struct ath11
+ 
+ 	ath11k_debugfs_fw_stats_init(ar);
+ 
++	ar->rx_mem_dentry = debugfs_create_file("rx_memory", 0400,
++						ar->debug.debugfs_pdev, ar,
++						&fops_rx_memory);
++	/* Keep the handle valid even if an error path removes its parent. */
++	if (IS_ERR_OR_NULL(ar->rx_mem_dentry))
++		ar->rx_mem_dentry = NULL;
++	else
++		dget(ar->rx_mem_dentry);
++
+ 	debugfs_create_file("ext_tx_stats", 0644,
+ 			    ar->debug.debugfs_pdev, ar,
+ 			    &fops_extd_tx_stats);
+@@ -1535,6 +1694,10 @@ void ath11k_debugfs_unregister(struct at
+ 	struct ath11k_dbg_dbr_data *dbr_dbg_data;
+ 	int i;
+ 
++	debugfs_remove(ar->rx_mem_dentry);
++	dput(ar->rx_mem_dentry);
++	ar->rx_mem_dentry = NULL;
++
+ 	for (i = 0; i < WMI_DIRECT_BUF_MAX; i++) {
+ 		dbr_debug = ar->debug.dbr_debug[i];
+ 		if (!dbr_debug)
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath11k/debugfs_rx_mem.h
+@@ -0,0 +1,64 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++#ifndef ATH11K_DEBUGFS_RX_MEM_H
++#define ATH11K_DEBUGFS_RX_MEM_H
++
++#include <linux/types.h>
++
++struct ath11k_rx_mem_page {
++	unsigned long head;
++	unsigned int order;
++};
++
++struct ath11k_rx_mem_totals {
++	u64 backing_bytes;
++	u32 unique_pages;
++	u32 order0_pages;
++	u32 higher_order_pages;
++	u32 inconsistent_pages;
++};
++
++static inline int ath11k_rx_mem_cmp(const void *a, const void *b)
++{
++	const struct ath11k_rx_mem_page *pa = a;
++	const struct ath11k_rx_mem_page *pb = b;
++
++	return (pa->head > pb->head) - (pa->head < pb->head);
++}
++
++/* Input is sorted by head. Addresses are identities only, never dereferenced. */
++static inline struct ath11k_rx_mem_totals
++ath11k_rx_mem_sum(const struct ath11k_rx_mem_page *pages, unsigned int count,
++		  unsigned int page_shift)
++{
++	struct ath11k_rx_mem_totals totals = {};
++	unsigned int i;
++	u64 bytes;
++
++	for (i = 0; i < count; i++) {
++		if (i && pages[i].head == pages[i - 1].head) {
++			if (pages[i].order != pages[i - 1].order)
++				totals.inconsistent_pages++;
++			continue;
++		}
++
++		if (page_shift >= 64 || pages[i].order >= 64 - page_shift) {
++			totals.inconsistent_pages++;
++			continue;
++		}
++		bytes = 1ULL << (page_shift + pages[i].order);
++		if (totals.backing_bytes > (~(u64)0) - bytes) {
++			totals.inconsistent_pages++;
++			continue;
++		}
++		totals.backing_bytes += bytes;
++		totals.unique_pages++;
++		if (pages[i].order)
++			totals.higher_order_pages++;
++		else
++			totals.order0_pages++;
++	}
++
++	return totals;
++}
++
++#endif /* ATH11K_DEBUGFS_RX_MEM_H */
+--- a/drivers/net/wireless/ath/ath11k/dp.c
++++ b/drivers/net/wireless/ath/ath11k/dp.c
+@@ -897,6 +897,9 @@ void ath11k_dp_pdev_pre_alloc(struct ath
+ 		ar = ab->pdevs[i].ar;
+ 		dp = &ar->dp;
+ 		dp->mac_id = i;
++		mutex_lock(&ar->rx_mem_mutex);
++		ar->rx_mem_ready = false;
++		ar->rx_mem_generation++;
+ 		idr_init(&dp->rx_refill_buf_ring.bufs_idr);
+ 		spin_lock_init(&dp->rx_refill_buf_ring.idr_lock);
+ 		atomic_set(&dp->num_tx_pending, 0);
+@@ -907,6 +910,7 @@ void ath11k_dp_pdev_pre_alloc(struct ath
+ 		}
+ 		idr_init(&dp->rxdma_mon_buf_ring.bufs_idr);
+ 		spin_lock_init(&dp->rxdma_mon_buf_ring.idr_lock);
++		mutex_unlock(&ar->rx_mem_mutex);
+ 	}
+ }
+ 
+@@ -931,6 +935,9 @@ int ath11k_dp_pdev_alloc(struct ath11k_b
+ 				    i);
+ 			goto err;
+ 		}
++		mutex_lock(&ar->rx_mem_mutex);
++		ar->rx_mem_ready = true;
++		mutex_unlock(&ar->rx_mem_mutex);
+ 	}
+ 
+ 	return 0;
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
+@@ -4457,8 +4457,11 @@ void ath11k_dp_rx_pdev_free(struct ath11
+ {
+ 	struct ath11k *ar = ab->pdevs[mac_id].ar;
+ 
++	mutex_lock(&ar->rx_mem_mutex);
++	ar->rx_mem_ready = false;
+ 	ath11k_dp_rx_pdev_srng_free(ar);
+ 	ath11k_dp_rxdma_pdev_buf_free(ar);
++	mutex_unlock(&ar->rx_mem_mutex);
+ }
+ 
+ int ath11k_dp_rx_pdev_alloc(struct ath11k_base *ab, int mac_id)
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -7,6 +7,7 @@
+ #include <net/mac80211.h>
+ #include <net/cfg80211.h>
+ #include <linux/etherdevice.h>
++#include <linux/debugfs.h>
+ #include <linux/bitfield.h>
+ #include <linux/inetdevice.h>
+ #include <net/if_inet6.h>
+@@ -10822,6 +10823,7 @@ int ath11k_mac_allocate(struct ath11k_ba
+ 		INIT_LIST_HEAD(&ar->arvifs);
+ 		INIT_LIST_HEAD(&ar->ppdu_stats_info);
+ 		mutex_init(&ar->conf_mutex);
++		mutex_init(&ar->rx_mem_mutex);
+ 		init_completion(&ar->vdev_setup_done);
+ 		init_completion(&ar->vdev_delete_done);
+ 		init_completion(&ar->peer_assoc_done);
+@@ -10871,6 +10873,9 @@ void ath11k_mac_destroy(struct ath11k_ba
+ 		if (!ar)
+ 			continue;
+ 
++		debugfs_remove(ar->rx_mem_dentry);
++		dput(ar->rx_mem_dentry);
++		ar->rx_mem_dentry = NULL;
+ 		ath11k_fw_stats_free(&ar->fw_stats);
+ 		ieee80211_free_hw(ar->hw);
+ 		pdev->ar = NULL;
